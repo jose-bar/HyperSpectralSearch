@@ -173,14 +173,6 @@ HyperSpectral can be configured with various parameters that affect preprocessin
 - `hd_id_flip_factor` (default: 2.0): Factor for ID hypervector generation
 - `fragment_tol` (default: 0.05): Fragment ion tolerance in Da
 
-## Comparison with MASST
-
-HyperSpectral was designed to provide similar functionality to MASST, but with significantly improved performance. Key advantages include:
-
-1. **Speed**: Typically 100-1000x faster than MASST for large datasets
-2. **Memory Efficiency**: Lower memory footprint for searching
-3. **Scalability**: Can handle billions of spectra with reasonable search times
-
 ## API Usage
 
 For programmatic use, you can directly use the `SpectraSearchPipeline` class:
