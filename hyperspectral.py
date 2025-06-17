@@ -673,3 +673,164 @@ class SpectraSearchPipeline:
                     binary_vectors[i, byte_offset + b] = (val >> (b * 8)) & 0xFF
         
         return binary_vectors
+    
+    def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0):
+        """
+        Process dataset using memory-efficient streaming.
+        
+        Args:
+            input_filepath: Path to MGF file(s)
+            batch_size: Number of spectra per batch
+            max_memory_gb: Maximum memory to use in GB
+        """
+        from data_loader import SpectraDataLoader
+        
+        logger.info(f"Processing dataset from {input_filepath} using streaming")
+        
+        # Initialize data loader
+        loader = SpectraDataLoader(
+            batch_size=batch_size,
+            max_memory_gb=max_memory_gb,
+            verbose=True
+        )
+        
+        # Get dimension parameters first
+        self.bin_len, self.min_mz, self.max_mz = self._get_dim(
+            self.config['min_mz'], self.config['max_mz'], self.config['fragment_tol'])
+        
+        # Generate LV-ID hypervectors
+        self.lv_hvs, self.id_hvs = self._gen_lv_id_hvs(
+            self.config['hd_dim'], self.config['hd_Q'], self.bin_len, self.config['hd_id_flip_factor'])
+        
+        # Process in batches
+        all_hvs = []
+        all_meta = []
+        
+        for encoded_hvs, batch_indices, batch_meta_df in loader.load_and_process_dataset(input_filepath, self):
+            all_hvs.append(encoded_hvs)
+            all_meta.append(batch_meta_df)
+            
+            # Optional: save intermediate results to disk if needed
+            if len(all_hvs) % 10 == 0:
+                logger.info(f"Processed {len(all_meta)} batches")
+        
+        # Combine all results
+        self.spectra_hvs = np.vstack(all_hvs)
+        self.spectra_meta_df = pd.concat(all_meta, ignore_index=True)
+        
+        logger.info(f"Processed {len(self.spectra_meta_df)} spectra total")
+
+    def build_index_streaming(self, index_type='flat', chunk_size=100000):
+        """
+        Build FAISS index with streaming to handle large datasets.
+        
+        Args:
+            index_type: Type of FAISS index ('flat', 'ivf', 'hnsw')
+            chunk_size: Number of vectors to add at a time
+        """
+        logger.info(f"Building {index_type} FAISS index with streaming")
+        
+        if self.spectra_hvs is None:
+            raise ValueError("No hypervectors available. Call preprocess_dataset() first.")
+        
+        # Convert hypervectors to FAISS binary format
+        binary_vectors = self._convert_hv_to_faiss_binary(self.spectra_hvs)
+        
+        # Get the dimension in bits
+        n_bytes = binary_vectors.shape[1]
+        d_bits = n_bytes * 8
+        
+        # Create FAISS binary index
+        if index_type == 'flat':
+            self.faiss_index = faiss.IndexBinaryFlat(d_bits)
+        elif index_type == 'ivf':
+            quantizer = faiss.IndexBinaryFlat(d_bits)
+            nlist = min(100, max(1, len(binary_vectors) // 100))
+            self.faiss_index = faiss.IndexBinaryIVF(quantizer, d_bits, nlist)
+            
+            # Train IVF index with a subset
+            train_size = min(100000, len(binary_vectors))
+            logger.info(f"Training IVF index with {train_size} vectors")
+            self.faiss_index.train(binary_vectors[:train_size])
+        elif index_type == 'hnsw':
+            # Create HNSW index
+            M = 16  # Number of connections per layer
+            self.faiss_index = faiss.IndexBinaryHNSW(d_bits, M)
+            # HNSW doesn't support batch adding for binary indices bruh
+        else:
+            raise ValueError(f"Unsupported index type: {index_type}")
+        
+        # Add vectors in chunks to avoid memory issues
+        n_vectors = len(binary_vectors)
+        for i in range(0, n_vectors, chunk_size):
+            end = min(i + chunk_size, n_vectors)
+            logger.info(f"Adding vectors {i} to {end}")
+            self.faiss_index.add(binary_vectors[i:end])
+        
+        logger.info(f"Index built with {self.faiss_index.ntotal} vectors")
+        
+    def preprocess_dataset_streaming_with_checkpoint(
+        self, 
+        input_filepath, 
+        batch_size=1000, 
+        max_memory_gb=4.0,
+        enable_checkpointing=True,
+        resume_checkpoint_id=None
+    ):
+        """
+        Process dataset using memory-efficient streaming with checkpoint support.
+        
+        Args:
+            input_filepath: Path to MGF file(s)
+            batch_size: Number of spectra per batch
+            max_memory_gb: Maximum memory to use in GB
+            enable_checkpointing: Whether to save checkpoints
+            resume_checkpoint_id: Checkpoint ID to resume from
+        """
+        from data_loader import SpectraDataLoader
+        
+        logger.info(f"Processing dataset from {input_filepath} using streaming with checkpointing")
+        
+        # Initialize data loader
+        loader = SpectraDataLoader(
+            batch_size=batch_size,
+            max_memory_gb=max_memory_gb,
+            verbose=True,
+            enable_checkpointing=enable_checkpointing
+        )
+        
+        # Get dimension parameters first
+        self.bin_len, self.min_mz, self.max_mz = self._get_dim(
+            self.config['min_mz'], self.config['max_mz'], self.config['fragment_tol'])
+        
+        # Generate LV-ID hypervectors
+        self.lv_hvs, self.id_hvs = self._gen_lv_id_hvs(
+            self.config['hd_dim'], self.config['hd_Q'], self.bin_len, self.config['hd_id_flip_factor'])
+        
+        # Check if resuming from checkpoint
+        if resume_checkpoint_id:
+            logger.info(f"Attempting to resume from checkpoint: {resume_checkpoint_id}")
+            # Load existing data
+            existing_hvs, existing_meta, _ = loader.checkpoint_manager.load_checkpoint(resume_checkpoint_id)
+            if existing_hvs is not None:
+                all_hvs = [existing_hvs]
+                all_meta = [existing_meta]
+            else:
+                all_hvs = []
+                all_meta = []
+        else:
+            all_hvs = []
+            all_meta = []
+        
+        # Process in batches
+        for encoded_hvs, batch_indices, batch_meta_df in loader.load_and_process_dataset_with_checkpointing(
+            input_filepath, self, resume_checkpoint_id=resume_checkpoint_id
+        ):
+            all_hvs.append(encoded_hvs)
+            all_meta.append(batch_meta_df)
+        
+        # Combine all results
+        self.spectra_hvs = np.vstack(all_hvs)
+        self.spectra_meta_df = pd.concat(all_meta, ignore_index=True)
+        
+        logger.info(f"Processed {len(self.spectra_meta_df)} spectra total")

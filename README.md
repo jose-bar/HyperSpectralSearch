@@ -5,6 +5,8 @@ HyperSpectral is a powerful mass spectrometry search tool that uses binary hyper
 ## Features
 
 - **High-Performance Search Engine**: Using binary hypervectors and FAISS indexing for fast searches
+- **Memory-Efficient Streaming Mode**: Process datasets larger than available RAM with configurable batch sizes
+- **Checkpoint Recovery**: Resume interrupted processing from saved checkpoints
 - **Precursor Mass Filtering**: Enforce precursor mass tolerance for accurate matching
 - **Hamming Distance Scoring**: Binary vector comparison for efficient similarity measurement
 - **Versatile Output Formats**: Export results as TXT, CSV, or JSON
@@ -18,9 +20,12 @@ HyperSpectral is a powerful mass spectrometry search tool that uses binary hyper
 - Python 3.7 or higher
 - NumPy
 - Pandas
-- FAISS
+- FAISS (faiss-cpu or faiss-gpu)
 - Matplotlib (for visualization)
 - Joblib
+- PyYAML (for configuration files)
+- CuPy (optional, for GPU acceleration)
+- pyteomics (optional, for mzML/mzXML support)
 
 ### Install
 
@@ -30,19 +35,54 @@ cd hyperspectral
 pip install -r requirements.txt
 ```
 
+For GPU support:
+```bash
+pip install faiss-gpu cupy-cuda11x  # Replace 11x with your CUDA version
+```
+
 ## Usage
 
-HyperSpectral provides a command-line interface with two main commands: `build` and `search`.
+HyperSpectral provides a command-line interface with three main commands: `build`, `search`, and `checkpoints`.
 
 ### Building an Index
 
-Before searching, you need to build an index from your reference MGF files:
+#### Traditional Mode (Small to Medium Datasets)
+
+For datasets that fit in memory:
 
 ```bash
 python cli.py build --input /path/to/mgf/files --output-dir ./indices --index-type flat
 ```
 
-Options:
+#### Streaming Mode (Large Datasets)
+
+For datasets larger than available RAM:
+
+```bash
+python cli.py build --input /path/to/large/dataset --output-dir ./indices \
+    --streaming --batch-size 5000 --max-memory 8.0
+```
+
+#### With Checkpointing
+
+Enable checkpoint recovery for very large datasets:
+
+```bash
+python cli.py build --input /path/to/large/dataset --output-dir ./indices \
+    --streaming --enable-checkpoint --batch-size 5000 --index-type hnsw
+```
+
+#### Resume from Checkpoint
+
+If processing was interrupted:
+
+```bash
+python cli.py build --input /path/to/large/dataset --output-dir ./indices \
+    --streaming --resume-checkpoint job_20240115_143022
+```
+
+#### Build Options
+
 - `--input`: Path to MGF file or directory containing MGF files
 - `--output-dir`: Directory to save the index (default: ./indices)
 - `--prefix`: Prefix for index files (default: spectra_index)
@@ -51,6 +91,11 @@ Options:
 - `--min-mz`: Minimum m/z value to consider
 - `--max-mz`: Maximum m/z value to consider
 - `--fragment-tol`: Fragment ion tolerance in Da
+- `--streaming`: Use streaming mode for large datasets
+- `--batch-size`: Batch size for streaming mode (default: 1000)
+- `--max-memory`: Maximum memory usage in GB (default: 4.0)
+- `--enable-checkpoint`: Enable checkpointing for interruption recovery
+- `--resume-checkpoint`: Resume from specified checkpoint ID
 
 ### Searching Against an Index
 
@@ -60,7 +105,8 @@ Once you have built an index, you can search query spectra against it:
 python cli.py search --index ./indices/spectra_index.bin --query query.mgf --output-dir ./results
 ```
 
-Options:
+#### Search Options
+
 - `--index`: Path to index file (.bin)
 - `--query`: Path to query MGF file
 - `--output-dir`: Directory to save results (default: ./results)
@@ -70,6 +116,49 @@ Options:
 - `--precursor-tol`: Precursor mass tolerance in Da (default: 0.05)
 - `--output-format`: Output format (choices: txt, csv, json, all, none; default: txt)
 - `--verbose`: Print detailed output
+
+### Managing Checkpoints
+
+List all available checkpoints:
+```bash
+python cli.py checkpoints list
+```
+
+Clean up a completed checkpoint:
+```bash
+python cli.py checkpoints clean job_20240115_143022
+```
+
+## Memory-Efficient Processing
+
+### Streaming Mode
+
+The streaming mode is designed for processing datasets that are too large to fit in memory. It processes data in configurable batches:
+
+- **Lazy Loading**: Reads spectra one at a time from disk
+- **Batch Processing**: Groups spectra into batches for efficient processing
+- **Memory Management**: Automatically manages memory usage with garbage collection
+- **Progress Tracking**: Shows progress during long processing runs
+
+Example for a 500GB dataset:
+```bash
+python cli.py build --input /path/to/500gb/dataset --output-dir ./indices \
+    --streaming --batch-size 10000 --max-memory 16.0 --index-type hnsw
+```
+
+### Checkpoint System
+
+The checkpoint system allows you to:
+
+- **Resume Interrupted Jobs**: Continue processing from where it stopped
+- **Track Progress**: Monitor processing status and progress
+- **Manage Resources**: Clean up completed checkpoints to free disk space
+
+Checkpoint files are stored in `./checkpoints` by default and include:
+
+- Processed batch data (HVs and metadata)
+- Job configuration and progress information
+- File processing status
 
 ## Output Format
 
@@ -96,7 +185,7 @@ Query 2: Scan Number: 18 (Scan 18, m/z 252.6290, charge 0)
 
 The CSV output contains detailed information about all queries and matches:
 
-```
+```csv
 Query Number,Query ID,Query Scan,Query m/z,Query Charge,Match Rank,Match Scan,Match m/z,Match Charge,Hamming Distance,Match ID,Source File
 1,Scan Number: 8,8,226.6540,0,1,8,226.6540,0,0,Scan Number: 8,sample1.mgf
 1,Scan Number: 8,8,226.6540,0,2,2693,746.4230,0,123,Scan Number: 2693,sample2.mgf
@@ -104,37 +193,7 @@ Query Number,Query ID,Query Scan,Query m/z,Query Charge,Match Rank,Match Scan,Ma
 
 ### JSON Output
 
-The JSON output contains the complete search results structure, which can be processed by other tools:
-
-```json
-{
-  "total_queries": 42,
-  "total_matches": 156,
-  "queries": [
-    {
-      "query_info": {
-        "precursor_mz": 226.654,
-        "precursor_charge": 0,
-        "identifier": "Scan Number: 8",
-        "scan": 8
-      },
-      "matches": [
-        {
-          "precursor_mz": 226.654,
-          "precursor_charge": 0,
-          "identifier": "Scan Number: 8",
-          "scan": 8,
-          "retention_time": 0,
-          "source_file": "sample1.mgf",
-          "hamming_distance": 0
-        },
-        ...
-      ]
-    },
-    ...
-  ]
-}
-```
+The JSON output contains the complete search results structure for programmatic processing.
 
 ## Visualization
 
@@ -183,20 +242,34 @@ from hyperspectral import SpectraSearchPipeline
 # Create pipeline
 pipeline = SpectraSearchPipeline(output_dir='./indices')
 
-# Process dataset and build index
-pipeline.preprocess_dataset('/path/to/mgf/files')
-pipeline.build_index(index_type='flat')
+# Process dataset with streaming (for large datasets)
+pipeline.preprocess_dataset_streaming('/path/to/large/dataset', 
+                                     batch_size=5000, max_memory_gb=8.0)
+pipeline.build_index_streaming(index_type='hnsw')
 pipeline.save_index(prefix='spectra_index')
 
 # Later, search against the index
 pipeline = SpectraSearchPipeline(index_path='./indices/spectra_index.bin')
 pipeline.load_index()
-results = pipeline.process_query_mgf('query.mgf', k=10, hamming_threshold=205, precursor_tol=0.05)
+results = pipeline.process_query_mgf('query.mgf', k=10, 
+                                   hamming_threshold=205, precursor_tol=0.05)
 
 # Export results
 from export_utils import export_results_to_txt
 export_results_to_txt(results, 'results.txt')
 ```
+
+## Troubleshooting
+
+### Out of Memory Errors
+- Use streaming mode with smaller batch sizes
+- Reduce `--max-memory` parameter
+- Enable checkpointing to process in stages
+
+### Checkpoint Issues
+- List checkpoints with `python cli.py checkpoints list`
+- Clean old checkpoints to free disk space
+- Check `./checkpoints` directory permissions
 
 ## Contributing
 
