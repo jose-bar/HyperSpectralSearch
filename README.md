@@ -35,11 +35,6 @@ cd hyperspectral
 pip install -r requirements.txt
 ```
 
-For GPU support:
-```bash
-pip install faiss-gpu cupy-cuda11x  # Replace 11x with your CUDA version
-```
-
 ## Usage
 
 HyperSpectral provides a command-line interface with three main commands: `build`, `search`, and `checkpoints`.
