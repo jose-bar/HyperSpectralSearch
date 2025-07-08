@@ -30,7 +30,7 @@ HyperSpectral is a powerful mass spectrometry search tool that uses binary hyper
 ### Install
 
 ```bash
-git clone https://github.com/yourusername/hyperspectral.git
+git clone https://github.com/jose-bar/hyperspectral.git
 cd hyperspectral
 pip install -r requirements.txt
 ```
