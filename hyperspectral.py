@@ -412,24 +412,52 @@ class SpectraSearchPipeline:
                         current_spectrum = None
                 
                 elif current_spectrum is not None:
+                    # Handle known metadata fields first
                     if line.startswith("TITLE="):
                         current_spectrum['identifier'] = line[6:]
                     elif line.startswith("PEPMASS="):
-                        current_spectrum['precursor_mz'] = float(line.split('=')[1].split()[0])
+                        parts = line.split('=')[1].split()
+                        current_spectrum['precursor_mz'] = float(parts[0])
+                        if len(parts) > 1:
+                            current_spectrum['precursor_intensity'] = float(parts[1])
                     elif line.startswith("CHARGE="):
                         charge_str = line.split('=')[1].strip()
-                        charge = int(charge_str.rstrip('+'))
-                        current_spectrum['precursor_charge'] = charge
+                        current_spectrum['precursor_charge'] = int(charge_str.rstrip('+'))
                     elif line.startswith("SCANS="):
                         current_spectrum['scan'] = int(line.split('=')[1])
+                    elif line.startswith("SCAN="):  # Handle both SCANS and SCAN
+                        if current_spectrum['scan'] == 0:  # Only use if SCANS wasn't set
+                            current_spectrum['scan'] = int(line.split('=')[1])
                     elif line.startswith("RTINSECONDS="):
                         current_spectrum['retention_time'] = float(line.split('=')[1])
-                    elif ' ' in line:
-                        mz, intensity = line.split()
-                        current_spectrum['peaks'].append((float(mz), float(intensity)))
+                    
+                    # Handle other common metadata fields (ignore them)
+                    elif any(line.startswith(prefix) for prefix in [
+                        "MSLEVEL=", "COLLISION_ENERGY=", "FILENAME=", "SEQ=", 
+                        "PROTEIN=", "SCORE=", "FDR=", "PROVENANCE_", "DATASET="
+                    ]):
+                        # Skip these metadata lines
+                        continue
+                    
+                    # Try to parse as peak data (m/z intensity pairs)
+                    elif ' ' in line or '\t' in line:
+                        # Split by whitespace (handles both spaces and tabs)
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                # Try to parse the first two parts as numbers
+                                mz = float(parts[0])
+                                intensity = float(parts[1])
+                                current_spectrum['peaks'].append((mz, intensity))
+                            except ValueError:
+                                # If parsing fails, it's probably metadata we don't recognize
+                                # Log it for debugging but don't crash
+                                logger.debug(f"Could not parse as peak data: {line}")
+                                continue
         
         logger.info(f"Loaded {len(spectra)} spectra from {mgf_file}")
         return spectra
+
     
     def _process_spectra(self, spectra_list):
         """Process a list of spectra."""

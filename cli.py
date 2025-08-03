@@ -98,7 +98,7 @@ def build_index(args):
     if args.streaming and args.enable_checkpoint and args.clean_checkpoint:
         logger.info("Cleaning up checkpoint files...")
         # The checkpoint manager should have saved the checkpoint ID
-        # You might want to save it and clean it up here
+        
 
 def search(args):
     """Search a query MGF against a prebuilt index."""
@@ -252,7 +252,7 @@ Examples:
     
     # Create subparsers
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
-    subparsers.required = True  # Make subcommand required
+    subparsers.required = True
     
     # ============ BUILD COMMAND ============
     build_parser = subparsers.add_parser('build', 
