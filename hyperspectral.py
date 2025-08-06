@@ -670,18 +670,21 @@ class SpectraSearchPipeline:
         return encoded_spectra
     
     def _bit_packing(self, vecs, N, D):
-        """Pack binary vectors into uint32 arrays."""
+        """Vectorized bit packing using numpy operations."""
         pack_len = (D + 32 - 1) // 32
         packed_vecs = np.zeros((N, pack_len), dtype=np.uint32)
         
-        for i in range(N):
-            for d in range(D):
-                if vecs[i, d] > 0:
-                    word_idx = d // 32
-                    bit_idx = d % 32
-                    packed_vecs[i, word_idx] |= (1 << (31 - bit_idx))
+        # Reshape for efficient processing
+        vecs_reshaped = vecs.reshape(N, -1, 32) if D % 32 == 0 else \
+                        np.pad(vecs, ((0, 0), (0, 32 - D % 32)), constant_values=0).reshape(N, -1, 32)
         
-        return packed_vecs
+        # Vectorized bit packing
+        for i in range(vecs_reshaped.shape[1]):
+            bits = vecs_reshaped[:, i, :]
+            powers = 2 ** np.arange(31, -1, -1, dtype=np.uint32)
+            packed_vecs[:, i] = np.dot(bits, powers)
+        
+        return packed_vecs[:, :pack_len]
     
     def _convert_hv_to_faiss_binary(self, hypervectors):
         """Convert hypervectors to FAISS binary format."""
