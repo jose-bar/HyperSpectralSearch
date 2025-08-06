@@ -688,22 +688,19 @@ class SpectraSearchPipeline:
     
     def _convert_hv_to_faiss_binary(self, hypervectors):
         """Convert hypervectors to FAISS binary format."""
-        n_vectors, n_uint32 = hypervectors.shape
-        D = n_uint32 * 32  # Original hypervector dimension
-        n_bytes = (D + 7) // 8  # Number of bytes needed for FAISS
+        if hypervectors.ndim == 1:
+            hypervectors = hypervectors.reshape(1, -1)
         
-        binary_vectors = np.zeros((n_vectors, n_bytes), dtype=np.uint8)
+        # Convert uint32 to bytes using numpy's view
+        byte_view = hypervectors.view(np.uint8)
         
-        for i in range(n_vectors):
-            for j in range(n_uint32):
-                val = hypervectors[i, j]
-                byte_offset = j * 4  # Each uint32 gives 4 bytes
-                
-                # Extract the 4 bytes from each uint32
-                for b in range(min(4, n_bytes - byte_offset)):
-                    binary_vectors[i, byte_offset + b] = (val >> (b * 8)) & 0xFF
+        # FAISS expects specific byte ordering - reshape appropriately
+        n_vectors = hypervectors.shape[0]
+        n_uint32 = hypervectors.shape[1]
+        n_bytes = n_uint32 * 4
         
-        return binary_vectors
+        # Ensure correct byte order for FAISS
+        return byte_view.reshape(n_vectors, n_bytes)
     
     def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0):
         """
