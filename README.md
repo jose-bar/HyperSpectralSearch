@@ -190,15 +190,6 @@ Query Number,Query ID,Query Scan,Query m/z,Query Charge,Match Rank,Match Scan,Ma
 
 The JSON output contains the complete search results structure for programmatic processing.
 
-## Visualization
-
-The `viz_utils.py` module provides several visualization functions for analyzing search results:
-
-1. **Mirror Plots**: Compare two spectra visually
-2. **Distance Histograms**: Analyze the distribution of Hamming distances
-3. **Precursor m/z Distribution**: Compare m/z values between queries and matches
-4. **Match Heatmaps**: Visual representation of Hamming distances between queries and matches
-
 ## Configuration Parameters
 
 HyperSpectral can be configured with various parameters that affect preprocessing, encoding, and searching:
