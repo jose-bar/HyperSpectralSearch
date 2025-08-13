@@ -58,7 +58,7 @@ def _process_query_chunk(query_chunk, index_path, k, hamming_threshold, precurso
         
         # Set search parameters
         if hasattr(pipeline.faiss_index, 'nprobe'):
-            pipeline.faiss_index.nprobe = 10
+            pipeline.faiss_index.nprobe = 128
         
         # Search all at once
         distances, indices = pipeline.faiss_index.search(batch_binary, k)
@@ -395,7 +395,7 @@ class SpectraSearchPipeline:
         # Set search parameters for IVF index if applicable
         if hasattr(self.faiss_index, 'nprobe'):
             # For IVF index, set nprobe (number of clusters to visit)
-            self.faiss_index.nprobe = 10
+            self.faiss_index.nprobe = 128
         
         # Search the index
         distances, indices = self.faiss_index.search(query_binary, k)
