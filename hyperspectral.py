@@ -22,91 +22,10 @@ import glob
 from typing import List, Dict, Tuple, Optional, Union, Any
 import joblib
 from collections import defaultdict
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-import functools
-
-# Import SPTXT loader
-from sptxt_loader import SPTXTLoader, convert_sptxt_to_mgf_format
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-def _process_query_chunk(query_chunk, index_path, k, hamming_threshold, precursor_tol, batch_size, config):
-    """
-    Process a chunk of queries in a separate process.
-    Each process loads its own copy of the index.
-    """
-    # Create a new pipeline instance in this process
-    pipeline = SpectraSearchPipeline(index_path=index_path)
-    pipeline.config = config
-    pipeline.load_index()
-    
-    # Process this chunk using batched method
-    results = []
-    
-    # Process chunk in smaller batches
-    for batch_start in range(0, len(query_chunk), batch_size):
-        batch_end = min(batch_start + batch_size, len(query_chunk))
-        batch_queries = query_chunk[batch_start:batch_end]
-        
-        # Process each query individually but collect for batch search
-        batch_data = []
-        for query in batch_queries:
-            processed = pipeline._preprocess_spectrum(query)
-            if processed:
-                query_hv = pipeline._encode_single_spectrum(processed[0], processed[1])
-                batch_data.append((query_hv, query, processed))
-        
-        if not batch_data:
-            continue
-            
-        # Extract for batch search
-        batch_hvs = [item[0] for item in batch_data]
-        batch_binary = pipeline._convert_hv_to_faiss_binary(np.array(batch_hvs))
-        
-        # Set search parameters
-        if hasattr(pipeline.faiss_index, 'nprobe'):
-            pipeline.faiss_index.nprobe = 10
-        
-        # Search all at once
-        distances, indices = pipeline.faiss_index.search(batch_binary, k)
-        
-        # Process results exactly like original
-        for i, (_, raw_query, processed_spectrum) in enumerate(batch_data):
-            query_distances = distances[i]
-            query_indices = indices[i]
-            
-            # Build results list exactly like original search method
-            search_results = []
-            for j, idx in enumerate(query_indices):
-                if idx != -1 and idx < len(pipeline.spectra_meta_df):
-                    spectrum_info = pipeline.spectra_meta_df.iloc[idx].to_dict()
-                    spectrum_info['hamming_distance'] = int(query_distances[j])
-                    search_results.append(spectrum_info)
-            
-            # Apply filtering exactly like original
-            matches = []
-            for match in search_results:
-                if match['hamming_distance'] <= hamming_threshold and \
-                   abs(match['precursor_mz'] - raw_query['precursor_mz']) <= precursor_tol:
-                    matches.append(match)
-            
-            # Add to results
-            query_info = {
-                'precursor_mz': raw_query['precursor_mz'],
-                'precursor_charge': raw_query['precursor_charge'],
-                'identifier': raw_query['identifier'],
-                'scan': raw_query['scan']
-            }
-            
-            results.append({
-                'query_info': query_info,
-                'matches': matches
-            })
-    
-    return results
 
 class SpectraSearchPipeline:
     """Main pipeline for encoding mass spectra into hypervectors and searching."""
@@ -325,7 +244,7 @@ class SpectraSearchPipeline:
         
         logger.info(f"Successfully loaded index with {len(self.spectra_meta_df)} spectra")
     
-    def process_query_mgf(self, query_mgf_path, k=10, hamming_threshold=None, precursor_tol=None, batch_size=50, n_workers=None):
+    def process_query_mgf(self, query_mgf_path, k=10, hamming_threshold=None, precursor_tol=None):
         """
         Process all spectra in a query MGF file and search for matches.
         Note: Only MGF format is supported for queries.
@@ -339,50 +258,72 @@ class SpectraSearchPipeline:
         Returns:
             Dictionary with search results summary and details
         """
-        logger.info(f"Processing query MGF file with multiprocessing: {query_mgf_path}")
-    
-        if n_workers is None:
-            n_workers = min(multiprocessing.cpu_count() - 1, 4)  # Leave 1 core free, max 4
+        logger.info(f"Processing query MGF file: {query_mgf_path}")
         
         # Use provided parameters or defaults from config
         hamming_threshold = hamming_threshold or self.config['hamming_threshold']
         precursor_tol = precursor_tol or self.config['precursor_tol']
         
-        # Load query spectra (MGF only for queries)
+        # Check if index is loaded
+        if self.faiss_index is None:
+            raise ValueError("No index loaded. Call load_index() first.")
+        
+        # Load query spectra
         query_spectra = self._load_mgf_file(query_mgf_path)
-        logger.info(f"Loaded {len(query_spectra)} spectra, using {n_workers} workers")
+        logger.info(f"Loaded {len(query_spectra)} spectra from {query_mgf_path}")
         
-        # Split queries into chunks for workers
-        chunk_size = max(1, len(query_spectra) // n_workers)
-        chunks = [query_spectra[i:i+chunk_size] for i in range(0, len(query_spectra), chunk_size)]
+        # Process each query
+        results = []
+        valid_spectra = 0
+        invalid_spectra = 0
         
-        # Process chunks in parallel
-        with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = []
-            for i, chunk in enumerate(chunks):
-                future = executor.submit(
-                    _process_query_chunk,
-                    chunk, self.index_path, k, hamming_threshold, precursor_tol, batch_size, self.config
-                )
-                futures.append(future)
-            
-            # Collect results
-            all_results = []
-            for i, future in enumerate(futures):
-                logger.info(f"Collecting results from worker {i+1}/{len(futures)}")
-                chunk_results = future.result()
-                all_results.extend(chunk_results)
-        
-        # Combine final results
-        total_matches = sum(len(r['matches']) for r in all_results)
-        
+        # Initialize results summary
         results_summary = {
-            'total_queries': len(all_results),
-            'total_matches': total_matches,
-            'queries': all_results
+            'total_queries': 0,
+            'total_matches': 0,
+            'queries': []
         }
         
-        logger.info(f"Parallel processing complete: {len(all_results)} queries, {total_matches} matches")
+        for i, query_spectrum in enumerate(query_spectra):
+            if i % 20 == 0 or i == len(query_spectra) - 1:
+                logger.info(f"Processing query {i+1}/{len(query_spectra)}")
+            
+            # Process the query spectrum
+            processed_spectrum = self._preprocess_spectrum(query_spectrum)
+            if processed_spectrum:
+                valid_spectra += 1
+                
+                # Search in the index
+                query_result = self.search(processed_spectrum, query_spectrum, k)
+                
+                # Apply hamming distance and precursor mass filtering
+                matches = []
+                for match in query_result['results']:
+                    if match['hamming_distance'] <= hamming_threshold and \
+                       abs(match['precursor_mz'] - query_spectrum['precursor_mz']) <= precursor_tol:
+                        matches.append(match)
+                
+                # Update results with filtered matches
+                query_info = query_result['query']
+                if matches:
+                    results_summary['total_matches'] += len(matches)
+                    results_summary['queries'].append({
+                        'query_info': query_info,
+                        'matches': matches
+                    })
+                else:
+                    results_summary['queries'].append({
+                        'query_info': query_info,
+                        'matches': []
+                    })
+                
+            else:
+                invalid_spectra += 1
+        
+        results_summary['total_queries'] = valid_spectra
+        logger.info(f"Query processing complete: {valid_spectra} valid spectra, {invalid_spectra} invalid spectra")
+        logger.info(f"Total matches: {results_summary['total_matches']}")
+        
         return results_summary
     
     def search(self, processed_spectrum, raw_spectrum, k=10):
@@ -795,32 +736,24 @@ class SpectraSearchPipeline:
         
         return lv_hvs, id_hvs
     
-    
     def _encode_single_spectrum(self, mz, intensity):
         """Encode a single spectrum into a hypervector."""
         D = self.config['hd_dim']
         Q = self.config['hd_Q']
         
-        # Find valid peaks using vectorized operations
-        valid_mask = (mz != -1) & (intensity != -1) & (mz < self.bin_len)
+        # Initialize output vector
+        encoded_hv = np.zeros(D, dtype=np.float32)
         
-        if not np.any(valid_mask):
-            # No valid peaks, return zero vector
-            final_hv = np.zeros(D, dtype=np.float32)
-            return self._bit_packing(final_hv.reshape(1, -1), 1, D)[0]
-        
-        valid_mz = mz[valid_mask].astype(np.int32)
-        valid_intensity = intensity[valid_mask]
-        
-        # Vectorized level index calculation
-        level_indices = np.minimum((valid_intensity * Q).astype(np.int32), Q)
-        
-        # Vectorized hypervector combination
-        lv_vectors = self.lv_hvs[level_indices]  # Shape: (n_peaks, D)
-        id_vectors = self.id_hvs[valid_mz]       # Shape: (n_peaks, D)
-        
-        # Element-wise multiplication and sum in one operation
-        encoded_hv = np.sum(lv_vectors * id_vectors, axis=0)
+        # For each peak, combine level and ID vectors
+        for i in range(len(mz)):
+            if mz[i] != -1 and intensity[i] != -1:
+                bin_idx = int(mz[i])
+                if bin_idx < self.bin_len:
+                    # Get level index (quantize intensity)
+                    level_idx = min(int(intensity[i] * Q), Q)
+                    
+                    # Add contribution from this peak
+                    encoded_hv += self.lv_hvs[level_idx] * self.id_hvs[bin_idx]
         
         # Binarize using majority rule
         binary_hv = np.ones(D, dtype=np.float32)
