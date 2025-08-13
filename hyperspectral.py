@@ -4,13 +4,6 @@ Core module for the HyperSpectral Search Pipeline.
 This module provides the main functionality for searching mass spectrometry data
 using binary hypervectors and FAISS indexing.
 """
-"""
-Core module for the HyperSpectral Search Pipeline with SPTXT support.
-
-This module provides the main functionality for searching mass spectrometry data
-using binary hypervectors and FAISS indexing. Now supports both MGF and SPTXT formats
-for building indices, with MGF-only support for queries.
-"""
 
 import numpy as np
 import pandas as pd
@@ -22,10 +15,88 @@ import glob
 from typing import List, Dict, Tuple, Optional, Union, Any
 import joblib
 from collections import defaultdict
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+import functools
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+def _process_query_chunk(query_chunk, index_path, k, hamming_threshold, precursor_tol, batch_size, config):
+    """
+    Process a chunk of queries in a separate process.
+    Each process loads its own copy of the index.
+    """
+    # Create a new pipeline instance in this process
+    pipeline = SpectraSearchPipeline(index_path=index_path)
+    pipeline.config = config
+    pipeline.load_index()
+    
+    # Process this chunk using batched method
+    results = []
+    
+    # Process chunk in smaller batches
+    for batch_start in range(0, len(query_chunk), batch_size):
+        batch_end = min(batch_start + batch_size, len(query_chunk))
+        batch_queries = query_chunk[batch_start:batch_end]
+        
+        # Process each query individually but collect for batch search
+        batch_data = []
+        for query in batch_queries:
+            processed = pipeline._preprocess_spectrum(query)
+            if processed:
+                query_hv = pipeline._encode_single_spectrum(processed[0], processed[1])
+                batch_data.append((query_hv, query, processed))
+        
+        if not batch_data:
+            continue
+            
+        # Extract for batch search
+        batch_hvs = [item[0] for item in batch_data]
+        batch_binary = pipeline._convert_hv_to_faiss_binary(np.array(batch_hvs))
+        
+        # Set search parameters
+        if hasattr(pipeline.faiss_index, 'nprobe'):
+            pipeline.faiss_index.nprobe = 10
+        
+        # Search all at once
+        distances, indices = pipeline.faiss_index.search(batch_binary, k)
+        
+        # Process results exactly like original
+        for i, (_, raw_query, processed_spectrum) in enumerate(batch_data):
+            query_distances = distances[i]
+            query_indices = indices[i]
+            
+            # Build results list exactly like original search method
+            search_results = []
+            for j, idx in enumerate(query_indices):
+                if idx != -1 and idx < len(pipeline.spectra_meta_df):
+                    spectrum_info = pipeline.spectra_meta_df.iloc[idx].to_dict()
+                    spectrum_info['hamming_distance'] = int(query_distances[j])
+                    search_results.append(spectrum_info)
+            
+            # Apply filtering exactly like original
+            matches = []
+            for match in search_results:
+                if match['hamming_distance'] <= hamming_threshold and \
+                   abs(match['precursor_mz'] - raw_query['precursor_mz']) <= precursor_tol:
+                    matches.append(match)
+            
+            # Add to results
+            query_info = {
+                'precursor_mz': raw_query['precursor_mz'],
+                'precursor_charge': raw_query['precursor_charge'],
+                'identifier': raw_query['identifier'],
+                'scan': raw_query['scan']
+            }
+            
+            results.append({
+                'query_info': query_info,
+                'matches': matches
+            })
+    
+    return results
 
 class SpectraSearchPipeline:
     """Main pipeline for encoding mass spectra into hypervectors and searching."""
@@ -81,18 +152,17 @@ class SpectraSearchPipeline:
             'min_matched_peaks': 6
         }
     
-    def preprocess_dataset(self, input_filepath, file_format='auto'):
+    def preprocess_dataset(self, input_filepath):
         """
         Process dataset and encode into hypervectors.
         
         Args:
-            input_filepath: Path to the spectral library file(s)
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto' to detect)
+            input_filepath: Path to the MGF file(s)
         """
-        logger.info(f"Processing dataset from {input_filepath} (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath}")
         
-        # Load and process spectra based on format
-        spectra_list = self._load_spectral_files(input_filepath, file_format)
+        # Load and process spectra
+        spectra_list = self._load_mgf_files(input_filepath)
         
         # Process spectra
         processed_spectra, spectra_meta = self._process_spectra(spectra_list)
@@ -244,10 +314,9 @@ class SpectraSearchPipeline:
         
         logger.info(f"Successfully loaded index with {len(self.spectra_meta_df)} spectra")
     
-    def process_query_mgf(self, query_mgf_path, k=10, hamming_threshold=None, precursor_tol=None):
+    def process_query_mgf(self, query_mgf_path, k=10, hamming_threshold=None, precursor_tol=None, batch_size=50, n_workers=None):
         """
         Process all spectra in a query MGF file and search for matches.
-        Note: Only MGF format is supported for queries.
         
         Args:
             query_mgf_path: Path to query MGF file
@@ -258,72 +327,50 @@ class SpectraSearchPipeline:
         Returns:
             Dictionary with search results summary and details
         """
-        logger.info(f"Processing query MGF file: {query_mgf_path}")
+        logger.info(f"Processing query MGF file with multiprocessing: {query_mgf_path}")
+    
+        if n_workers is None:
+            n_workers = min(multiprocessing.cpu_count() - 1, 4)  # Leave 1 core free, max 4
         
         # Use provided parameters or defaults from config
         hamming_threshold = hamming_threshold or self.config['hamming_threshold']
         precursor_tol = precursor_tol or self.config['precursor_tol']
         
-        # Check if index is loaded
-        if self.faiss_index is None:
-            raise ValueError("No index loaded. Call load_index() first.")
-        
         # Load query spectra
         query_spectra = self._load_mgf_file(query_mgf_path)
-        logger.info(f"Loaded {len(query_spectra)} spectra from {query_mgf_path}")
+        logger.info(f"Loaded {len(query_spectra)} spectra, using {n_workers} workers")
         
-        # Process each query
-        results = []
-        valid_spectra = 0
-        invalid_spectra = 0
+        # Split queries into chunks for workers
+        chunk_size = max(1, len(query_spectra) // n_workers)
+        chunks = [query_spectra[i:i+chunk_size] for i in range(0, len(query_spectra), chunk_size)]
         
-        # Initialize results summary
+        # Process chunks in parallel
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = []
+            for i, chunk in enumerate(chunks):
+                future = executor.submit(
+                    _process_query_chunk,
+                    chunk, self.index_path, k, hamming_threshold, precursor_tol, batch_size, self.config
+                )
+                futures.append(future)
+            
+            # Collect results
+            all_results = []
+            for i, future in enumerate(futures):
+                logger.info(f"Collecting results from worker {i+1}/{len(futures)}")
+                chunk_results = future.result()
+                all_results.extend(chunk_results)
+        
+        # Combine final results
+        total_matches = sum(len(r['matches']) for r in all_results)
+        
         results_summary = {
-            'total_queries': 0,
-            'total_matches': 0,
-            'queries': []
+            'total_queries': len(all_results),
+            'total_matches': total_matches,
+            'queries': all_results
         }
         
-        for i, query_spectrum in enumerate(query_spectra):
-            if i % 20 == 0 or i == len(query_spectra) - 1:
-                logger.info(f"Processing query {i+1}/{len(query_spectra)}")
-            
-            # Process the query spectrum
-            processed_spectrum = self._preprocess_spectrum(query_spectrum)
-            if processed_spectrum:
-                valid_spectra += 1
-                
-                # Search in the index
-                query_result = self.search(processed_spectrum, query_spectrum, k)
-                
-                # Apply hamming distance and precursor mass filtering
-                matches = []
-                for match in query_result['results']:
-                    if match['hamming_distance'] <= hamming_threshold and \
-                       abs(match['precursor_mz'] - query_spectrum['precursor_mz']) <= precursor_tol:
-                        matches.append(match)
-                
-                # Update results with filtered matches
-                query_info = query_result['query']
-                if matches:
-                    results_summary['total_matches'] += len(matches)
-                    results_summary['queries'].append({
-                        'query_info': query_info,
-                        'matches': matches
-                    })
-                else:
-                    results_summary['queries'].append({
-                        'query_info': query_info,
-                        'matches': []
-                    })
-                
-            else:
-                invalid_spectra += 1
-        
-        results_summary['total_queries'] = valid_spectra
-        logger.info(f"Query processing complete: {valid_spectra} valid spectra, {invalid_spectra} invalid spectra")
-        logger.info(f"Total matches: {results_summary['total_matches']}")
-        
+        logger.info(f"Parallel processing complete: {len(all_results)} queries, {total_matches} matches")
         return results_summary
     
     def search(self, processed_spectrum, raw_spectrum, k=10):
@@ -372,110 +419,6 @@ class SpectraSearchPipeline:
         }
 
     # Internal helper methods
-    def _detect_file_format(self, filepath):
-        """
-        Detect the format of a spectral library file.
-        
-        Args:
-            filepath: Path to the file
-            
-        Returns:
-            'mgf', 'sptxt', or None if unknown
-        """
-        # Check file extension first
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in ['.mgf']:
-            return 'mgf'
-        elif ext in ['.sptxt', '.splib', '.spl']:
-            return 'sptxt'
-        
-        # Try to detect by content
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                # Read first few lines
-                for _ in range(20):
-                    line = f.readline()
-                    if not line:
-                        break
-                    
-                    # Check for MGF markers
-                    if 'BEGIN IONS' in line:
-                        return 'mgf'
-                    
-                    # Check for SPTXT markers
-                    if line.startswith('Name:') or line.startswith('LibID:'):
-                        return 'sptxt'
-        except Exception as e:
-            logger.warning(f"Could not detect format of {filepath}: {e}")
-        
-        return None
-    
-    def _load_spectral_files(self, input_filepath, file_format='auto'):
-        """
-        Load spectral library files (MGF or SPTXT).
-        
-        Args:
-            input_filepath: Path to file(s)
-            file_format: 'mgf', 'sptxt', or 'auto' to detect
-            
-        Returns:
-            List of spectra in internal format
-        """
-        all_spectra = []
-        
-        # Get list of files to process
-        if os.path.isdir(input_filepath):
-            # Directory - find all relevant files
-            files = []
-            
-            if file_format == 'mgf' or file_format == 'auto':
-                files.extend(glob.glob(os.path.join(input_filepath, '*.mgf')))
-                files.extend(glob.glob(os.path.join(input_filepath, '*.MGF')))
-            
-            if file_format == 'sptxt' or file_format == 'auto':
-                for ext in ['*.sptxt', '*.splib', '*.spl', '*.SPTXT', '*.SPLIB', '*.SPL']:
-                    files.extend(glob.glob(os.path.join(input_filepath, ext)))
-            
-            files = list(set(files))  # Remove duplicates
-        else:
-            # Single file
-            files = [input_filepath]
-        
-        if not files:
-            raise FileNotFoundError(f"No spectral library files found in {input_filepath}")
-        
-        logger.info(f"Found {len(files)} spectral library files")
-        
-        # Process each file
-        for filepath in files:
-            # Determine format
-            if file_format == 'auto':
-                detected_format = self._detect_file_format(filepath)
-                if detected_format is None:
-                    logger.warning(f"Could not detect format of {filepath}, skipping")
-                    continue
-            else:
-                detected_format = file_format
-            
-            # Load based on format
-            if detected_format == 'mgf':
-                logger.info(f"Loading MGF file: {filepath}")
-                spectra = self._load_mgf_file(filepath)
-                all_spectra.extend(spectra)
-            
-            elif detected_format == 'sptxt':
-                logger.info(f"Loading SPTXT file: {filepath}")
-                spectra = SPTXTLoader.load_sptxt_file(filepath, include_annotations=False)
-                # Convert to internal format if needed
-                spectra = convert_sptxt_to_mgf_format(spectra)
-                all_spectra.extend(spectra)
-            
-            else:
-                logger.warning(f"Unknown format for {filepath}, skipping")
-        
-        logger.info(f"Loaded {len(all_spectra)} spectra total")
-        return all_spectra
-    
     def _load_mgf_files(self, input_filepath):
         """Load MGF files from the input filepath."""
         # Check if input is a directory or a file
@@ -583,25 +526,14 @@ class SpectraSearchPipeline:
             if processed_spectrum:
                 processed_spectra.append(processed_spectrum)
                 
-                # Build metadata dictionary
-                meta_dict = {
+                spectra_meta.append({
                     'precursor_mz': spectrum['precursor_mz'],
                     'precursor_charge': spectrum['precursor_charge'],
                     'identifier': spectrum['identifier'],
                     'scan': spectrum['scan'],
                     'retention_time': spectrum['retention_time'],
                     'source_file': spectrum.get('source_file', '')
-                }
-                
-                # Add peptide sequence if available (from SPTXT)
-                if 'peptide_sequence' in spectrum:
-                    meta_dict['peptide_sequence'] = spectrum['peptide_sequence']
-                
-                # Add any additional metadata
-                if 'metadata' in spectrum:
-                    meta_dict['library_metadata'] = spectrum['metadata']
-                
-                spectra_meta.append(meta_dict)
+                })
         
         logger.info(f"Processed {len(processed_spectra)} valid spectra")
         return processed_spectra, spectra_meta
@@ -736,24 +668,32 @@ class SpectraSearchPipeline:
         
         return lv_hvs, id_hvs
     
+    
     def _encode_single_spectrum(self, mz, intensity):
         """Encode a single spectrum into a hypervector."""
         D = self.config['hd_dim']
         Q = self.config['hd_Q']
         
-        # Initialize output vector
-        encoded_hv = np.zeros(D, dtype=np.float32)
+        # Find valid peaks using vectorized operations
+        valid_mask = (mz != -1) & (intensity != -1) & (mz < self.bin_len)
         
-        # For each peak, combine level and ID vectors
-        for i in range(len(mz)):
-            if mz[i] != -1 and intensity[i] != -1:
-                bin_idx = int(mz[i])
-                if bin_idx < self.bin_len:
-                    # Get level index (quantize intensity)
-                    level_idx = min(int(intensity[i] * Q), Q)
-                    
-                    # Add contribution from this peak
-                    encoded_hv += self.lv_hvs[level_idx] * self.id_hvs[bin_idx]
+        if not np.any(valid_mask):
+            # No valid peaks, return zero vector
+            final_hv = np.zeros(D, dtype=np.float32)
+            return self._bit_packing(final_hv.reshape(1, -1), 1, D)[0]
+        
+        valid_mz = mz[valid_mask].astype(np.int32)
+        valid_intensity = intensity[valid_mask]
+        
+        # Vectorized level index calculation
+        level_indices = np.minimum((valid_intensity * Q).astype(np.int32), Q)
+        
+        # Vectorized hypervector combination
+        lv_vectors = self.lv_hvs[level_indices]  # Shape: (n_peaks, D)
+        id_vectors = self.id_hvs[valid_mz]       # Shape: (n_peaks, D)
+        
+        # Element-wise multiplication and sum in one operation
+        encoded_hv = np.sum(lv_vectors * id_vectors, axis=0)
         
         # Binarize using majority rule
         binary_hv = np.ones(D, dtype=np.float32)
@@ -826,26 +766,24 @@ class SpectraSearchPipeline:
         # Ensure correct byte order for FAISS
         return byte_view.reshape(n_vectors, n_bytes)
     
-    def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0, file_format='auto'):
+    def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0):
         """
         Process dataset using memory-efficient streaming.
         
         Args:
-            input_filepath: Path to spectral library file(s)
+            input_filepath: Path to MGF file(s)
             batch_size: Number of spectra per batch
             max_memory_gb: Maximum memory to use in GB
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto')
         """
         from data_loader import SpectraDataLoader
         
-        logger.info(f"Processing dataset from {input_filepath} using streaming (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath} using streaming")
         
         # Initialize data loader
         loader = SpectraDataLoader(
             batch_size=batch_size,
             max_memory_gb=max_memory_gb,
-            verbose=True,
-            file_format=file_format  # Pass format to loader
+            verbose=True
         )
         
         # Get dimension parameters first
@@ -910,7 +848,7 @@ class SpectraSearchPipeline:
             # Create HNSW index
             M = 16  # Number of connections per layer
             self.faiss_index = faiss.IndexBinaryHNSW(d_bits, M)
-            # HNSW doesn't support batch adding for binary indices
+            # HNSW doesn't support batch adding for binary indices bruh
         else:
             raise ValueError(f"Unsupported index type: {index_type}")
         
@@ -929,31 +867,28 @@ class SpectraSearchPipeline:
         batch_size=1000, 
         max_memory_gb=4.0,
         enable_checkpointing=True,
-        resume_checkpoint_id=None,
-        file_format='auto'
+        resume_checkpoint_id=None
     ):
         """
         Process dataset using memory-efficient streaming with checkpoint support.
         
         Args:
-            input_filepath: Path to spectral library file(s)
+            input_filepath: Path to MGF file(s)
             batch_size: Number of spectra per batch
             max_memory_gb: Maximum memory to use in GB
             enable_checkpointing: Whether to save checkpoints
             resume_checkpoint_id: Checkpoint ID to resume from
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto')
         """
         from data_loader import SpectraDataLoader
         
-        logger.info(f"Processing dataset from {input_filepath} using streaming with checkpointing (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath} using streaming with checkpointing")
         
         # Initialize data loader
         loader = SpectraDataLoader(
             batch_size=batch_size,
             max_memory_gb=max_memory_gb,
             verbose=True,
-            enable_checkpointing=enable_checkpointing,
-            file_format=file_format  # Pass format to loader
+            enable_checkpointing=enable_checkpointing
         )
         
         # Get dimension parameters first
