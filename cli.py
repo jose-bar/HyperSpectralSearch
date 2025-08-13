@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Command-line interface for HyperSpectral Search with SPTXT support.
+Command-line interface for HyperSpectral Search.
 
-This module provides a command-line interface for building indices from MGF or SPTXT files,
-searching spectra (MGF only), and exporting results with checkpoint support.
+This module provides a command-line interface for building indices,
+searching spectra, and exporting results with checkpoint support.
 """
 
 import os
@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 def build_index(args):
-    """Build a search index from MGF or SPTXT files."""
+    """Build a search index from MGF files."""
     start_time = time.time()
     
     # Create pipeline
@@ -58,8 +58,7 @@ def build_index(args):
                 batch_size=args.batch_size,
                 max_memory_gb=args.max_memory,
                 enable_checkpointing=True,
-                resume_checkpoint_id=args.resume_checkpoint,
-                file_format=args.format
+                resume_checkpoint_id=args.resume_checkpoint
             )
         else:
             # New streaming job
@@ -70,16 +69,14 @@ def build_index(args):
                     batch_size=args.batch_size,
                     max_memory_gb=args.max_memory,
                     enable_checkpointing=True,
-                    resume_checkpoint_id=None,
-                    file_format=args.format
+                    resume_checkpoint_id=None
                 )
             else:
                 # Streaming without checkpointing
                 pipeline.preprocess_dataset_streaming(
                     args.input, 
                     batch_size=args.batch_size,
-                    max_memory_gb=args.max_memory,
-                    file_format=args.format
+                    max_memory_gb=args.max_memory
                 )
         
         # Build index with streaming
@@ -88,7 +85,7 @@ def build_index(args):
     else:
         # Traditional mode (loads all data at once)
         logger.info("Using traditional mode (loading all data into memory)")
-        pipeline.preprocess_dataset(args.input, file_format=args.format)
+        pipeline.preprocess_dataset(args.input)
         pipeline.build_index(index_type=args.index_type)
     
     # Save index
@@ -97,25 +94,15 @@ def build_index(args):
     elapsed_time = time.time() - start_time
     logger.info(f"Index building completed in {elapsed_time:.2f} seconds")
     
-    # Log format statistics if available
-    if pipeline.spectra_meta_df is not None:
-        total_spectra = len(pipeline.spectra_meta_df)
-        logger.info(f"Total spectra in index: {total_spectra}")
+    # Clean up checkpoint if requested
+    if args.streaming and args.enable_checkpoint and args.clean_checkpoint:
+        logger.info("Cleaning up checkpoint files...")
+        # The checkpoint manager should have saved the checkpoint ID
         
-        # Check for peptide sequences (indicates SPTXT data)
-        if 'peptide_sequence' in pipeline.spectra_meta_df.columns:
-            unique_peptides = pipeline.spectra_meta_df['peptide_sequence'].nunique()
-            logger.info(f"Unique peptide sequences: {unique_peptides}")
-    
 
 def search(args):
     """Search a query MGF against a prebuilt index."""
     start_time = time.time()
-    
-    # Validate that query is MGF format
-    if not args.query.lower().endswith('.mgf'):
-        logger.warning("Note: Only MGF format is supported for query files. "
-                      "SPTXT files can only be used for building the library index.")
     
     # Create pipeline
     pipeline = SpectraSearchPipeline(index_path=args.index)
@@ -209,25 +196,6 @@ def clean_checkpoint(args):
         print(f"Error cleaning up checkpoint: {e}")
         sys.exit(1)
 
-def convert_sptxt(args):
-    """Convert SPTXT files to MGF format."""
-    from sptxt_loader import SPTXTLoader
-    from mgf_utils import write_mgf_file
-    
-    logger.info(f"Converting SPTXT file(s) from {args.input} to MGF")
-    
-    # Load SPTXT files
-    spectra = SPTXTLoader.load_sptxt_files(args.input, include_annotations=args.include_annotations)
-    
-    if not spectra:
-        logger.error("No spectra found in input files")
-        sys.exit(1)
-    
-    # Write to MGF
-    write_mgf_file(spectra, args.output)
-    
-    logger.info(f"Successfully converted {len(spectra)} spectra to {args.output}")
-
 def print_sample_results(results):
     """Print sample results to console."""
     print("\nSample Results:")
@@ -255,18 +223,12 @@ def print_sample_results(results):
 def main():
     """Main entry point for the CLI."""
     parser = argparse.ArgumentParser(
-        description='HyperSpectral Search Tools for Mass Spectrometry Data (with SPTXT support)',
+        description='HyperSpectral Search Tools for Mass Spectrometry Data',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Build index from MGF files
+  # Build index with traditional mode
   %(prog)s build --input /path/to/mgf/files --output-dir ./indices
-  
-  # Build index from SPTXT files
-  %(prog)s build --input /path/to/sptxt/files --output-dir ./indices --format sptxt
-  
-  # Build index with auto-detection of format
-  %(prog)s build --input /path/to/mixed/files --output-dir ./indices --format auto
   
   # Build index with streaming mode and checkpointing
   %(prog)s build --input /path/to/large/dataset --output-dir ./indices \\
@@ -276,12 +238,9 @@ Examples:
   %(prog)s build --input /path/to/large/dataset --output-dir ./indices \\
       --streaming --resume-checkpoint job_20240115_143022
   
-  # Search against index (MGF queries only)
+  # Search against index
   %(prog)s search --index ./indices/spectra_index.bin --query query.mgf \\
       --output-dir ./results --top-k 20
-  
-  # Convert SPTXT to MGF
-  %(prog)s convert --input library.sptxt --output library.mgf
   
   # List checkpoints
   %(prog)s checkpoints list
@@ -297,17 +256,12 @@ Examples:
     
     # ============ BUILD COMMAND ============
     build_parser = subparsers.add_parser('build', 
-                                       help='Build a search index from MGF or SPTXT files',
+                                       help='Build a search index from MGF files',
                                        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     
     # Required arguments
     build_parser.add_argument('--input', required=True, 
-                            help='Input MGF/SPTXT file or directory containing spectral library files')
-    
-    # Format specification
-    build_parser.add_argument('--format', choices=['mgf', 'sptxt', 'auto'], 
-                            default='auto', 
-                            help='Input file format (auto-detect by default)')
+                            help='Input MGF file or directory containing MGF files')
     
     # Output options
     build_parser.add_argument('--output-dir', default='./indices', 
@@ -349,14 +303,14 @@ Examples:
     
     # ============ SEARCH COMMAND ============
     search_parser = subparsers.add_parser('search', 
-                                        help='Search a query MGF against a prebuilt index (MGF format only)',
+                                        help='Search a query MGF against a prebuilt index',
                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     
     # Required arguments
     search_parser.add_argument('--index', required=True, 
                              help='Path to index file (.bin)')
     search_parser.add_argument('--query', required=True, 
-                             help='Query MGF file (SPTXT not supported for queries)')
+                             help='Query MGF file')
     
     # Output options
     search_parser.add_argument('--output-dir', default='./results', 
@@ -380,20 +334,6 @@ Examples:
                              help='Print detailed output')
     
     search_parser.set_defaults(func=search)
-    
-    # ============ CONVERT COMMAND ============
-    convert_parser = subparsers.add_parser('convert', 
-                                         help='Convert SPTXT files to MGF format',
-                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    
-    convert_parser.add_argument('--input', required=True,
-                              help='Input SPTXT file or directory')
-    convert_parser.add_argument('--output', required=True,
-                              help='Output MGF file')
-    convert_parser.add_argument('--include-annotations', action='store_true',
-                              help='Include peak annotations in output')
-    
-    convert_parser.set_defaults(func=convert_sptxt)
     
     # ============ CHECKPOINTS COMMAND ============
     checkpoint_parser = subparsers.add_parser('checkpoints', 

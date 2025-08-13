@@ -4,13 +4,6 @@ Core module for the HyperSpectral Search Pipeline.
 This module provides the main functionality for searching mass spectrometry data
 using binary hypervectors and FAISS indexing.
 """
-"""
-Core module for the HyperSpectral Search Pipeline with SPTXT support.
-
-This module provides the main functionality for searching mass spectrometry data
-using binary hypervectors and FAISS indexing. Now supports both MGF and SPTXT formats
-for building indices, with MGF-only support for queries.
-"""
 
 import numpy as np
 import pandas as pd
@@ -25,9 +18,6 @@ from collections import defaultdict
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 import functools
-
-# Import SPTXT loader
-from sptxt_loader import SPTXTLoader, convert_sptxt_to_mgf_format
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -162,18 +152,17 @@ class SpectraSearchPipeline:
             'min_matched_peaks': 6
         }
     
-    def preprocess_dataset(self, input_filepath, file_format='auto'):
+    def preprocess_dataset(self, input_filepath):
         """
         Process dataset and encode into hypervectors.
         
         Args:
-            input_filepath: Path to the spectral library file(s)
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto' to detect)
+            input_filepath: Path to the MGF file(s)
         """
-        logger.info(f"Processing dataset from {input_filepath} (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath}")
         
-        # Load and process spectra based on format
-        spectra_list = self._load_spectral_files(input_filepath, file_format)
+        # Load and process spectra
+        spectra_list = self._load_mgf_files(input_filepath)
         
         # Process spectra
         processed_spectra, spectra_meta = self._process_spectra(spectra_list)
@@ -328,7 +317,6 @@ class SpectraSearchPipeline:
     def process_query_mgf(self, query_mgf_path, k=10, hamming_threshold=None, precursor_tol=None, batch_size=50, n_workers=None):
         """
         Process all spectra in a query MGF file and search for matches.
-        Note: Only MGF format is supported for queries.
         
         Args:
             query_mgf_path: Path to query MGF file
@@ -348,7 +336,7 @@ class SpectraSearchPipeline:
         hamming_threshold = hamming_threshold or self.config['hamming_threshold']
         precursor_tol = precursor_tol or self.config['precursor_tol']
         
-        # Load query spectra (MGF only for queries)
+        # Load query spectra
         query_spectra = self._load_mgf_file(query_mgf_path)
         logger.info(f"Loaded {len(query_spectra)} spectra, using {n_workers} workers")
         
@@ -431,110 +419,6 @@ class SpectraSearchPipeline:
         }
 
     # Internal helper methods
-    def _detect_file_format(self, filepath):
-        """
-        Detect the format of a spectral library file.
-        
-        Args:
-            filepath: Path to the file
-            
-        Returns:
-            'mgf', 'sptxt', or None if unknown
-        """
-        # Check file extension first
-        ext = os.path.splitext(filepath)[1].lower()
-        if ext in ['.mgf']:
-            return 'mgf'
-        elif ext in ['.sptxt', '.splib', '.spl']:
-            return 'sptxt'
-        
-        # Try to detect by content
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                # Read first few lines
-                for _ in range(20):
-                    line = f.readline()
-                    if not line:
-                        break
-                    
-                    # Check for MGF markers
-                    if 'BEGIN IONS' in line:
-                        return 'mgf'
-                    
-                    # Check for SPTXT markers
-                    if line.startswith('Name:') or line.startswith('LibID:'):
-                        return 'sptxt'
-        except Exception as e:
-            logger.warning(f"Could not detect format of {filepath}: {e}")
-        
-        return None
-    
-    def _load_spectral_files(self, input_filepath, file_format='auto'):
-        """
-        Load spectral library files (MGF or SPTXT).
-        
-        Args:
-            input_filepath: Path to file(s)
-            file_format: 'mgf', 'sptxt', or 'auto' to detect
-            
-        Returns:
-            List of spectra in internal format
-        """
-        all_spectra = []
-        
-        # Get list of files to process
-        if os.path.isdir(input_filepath):
-            # Directory - find all relevant files
-            files = []
-            
-            if file_format == 'mgf' or file_format == 'auto':
-                files.extend(glob.glob(os.path.join(input_filepath, '*.mgf')))
-                files.extend(glob.glob(os.path.join(input_filepath, '*.MGF')))
-            
-            if file_format == 'sptxt' or file_format == 'auto':
-                for ext in ['*.sptxt', '*.splib', '*.spl', '*.SPTXT', '*.SPLIB', '*.SPL']:
-                    files.extend(glob.glob(os.path.join(input_filepath, ext)))
-            
-            files = list(set(files))  # Remove duplicates
-        else:
-            # Single file
-            files = [input_filepath]
-        
-        if not files:
-            raise FileNotFoundError(f"No spectral library files found in {input_filepath}")
-        
-        logger.info(f"Found {len(files)} spectral library files")
-        
-        # Process each file
-        for filepath in files:
-            # Determine format
-            if file_format == 'auto':
-                detected_format = self._detect_file_format(filepath)
-                if detected_format is None:
-                    logger.warning(f"Could not detect format of {filepath}, skipping")
-                    continue
-            else:
-                detected_format = file_format
-            
-            # Load based on format
-            if detected_format == 'mgf':
-                logger.info(f"Loading MGF file: {filepath}")
-                spectra = self._load_mgf_file(filepath)
-                all_spectra.extend(spectra)
-            
-            elif detected_format == 'sptxt':
-                logger.info(f"Loading SPTXT file: {filepath}")
-                spectra = SPTXTLoader.load_sptxt_file(filepath, include_annotations=False)
-                # Convert to internal format if needed
-                spectra = convert_sptxt_to_mgf_format(spectra)
-                all_spectra.extend(spectra)
-            
-            else:
-                logger.warning(f"Unknown format for {filepath}, skipping")
-        
-        logger.info(f"Loaded {len(all_spectra)} spectra total")
-        return all_spectra
-    
     def _load_mgf_files(self, input_filepath):
         """Load MGF files from the input filepath."""
         # Check if input is a directory or a file
@@ -642,25 +526,14 @@ class SpectraSearchPipeline:
             if processed_spectrum:
                 processed_spectra.append(processed_spectrum)
                 
-                # Build metadata dictionary
-                meta_dict = {
+                spectra_meta.append({
                     'precursor_mz': spectrum['precursor_mz'],
                     'precursor_charge': spectrum['precursor_charge'],
                     'identifier': spectrum['identifier'],
                     'scan': spectrum['scan'],
                     'retention_time': spectrum['retention_time'],
                     'source_file': spectrum.get('source_file', '')
-                }
-                
-                # Add peptide sequence if available (from SPTXT)
-                if 'peptide_sequence' in spectrum:
-                    meta_dict['peptide_sequence'] = spectrum['peptide_sequence']
-                
-                # Add any additional metadata
-                if 'metadata' in spectrum:
-                    meta_dict['library_metadata'] = spectrum['metadata']
-                
-                spectra_meta.append(meta_dict)
+                })
         
         logger.info(f"Processed {len(processed_spectra)} valid spectra")
         return processed_spectra, spectra_meta
@@ -893,26 +766,24 @@ class SpectraSearchPipeline:
         # Ensure correct byte order for FAISS
         return byte_view.reshape(n_vectors, n_bytes)
     
-    def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0, file_format='auto'):
+    def preprocess_dataset_streaming(self, input_filepath, batch_size=1000, max_memory_gb=4.0):
         """
         Process dataset using memory-efficient streaming.
         
         Args:
-            input_filepath: Path to spectral library file(s)
+            input_filepath: Path to MGF file(s)
             batch_size: Number of spectra per batch
             max_memory_gb: Maximum memory to use in GB
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto')
         """
         from data_loader import SpectraDataLoader
         
-        logger.info(f"Processing dataset from {input_filepath} using streaming (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath} using streaming")
         
         # Initialize data loader
         loader = SpectraDataLoader(
             batch_size=batch_size,
             max_memory_gb=max_memory_gb,
-            verbose=True,
-            file_format=file_format  # Pass format to loader
+            verbose=True
         )
         
         # Get dimension parameters first
@@ -977,7 +848,7 @@ class SpectraSearchPipeline:
             # Create HNSW index
             M = 16  # Number of connections per layer
             self.faiss_index = faiss.IndexBinaryHNSW(d_bits, M)
-            # HNSW doesn't support batch adding for binary indices
+            # HNSW doesn't support batch adding for binary indices bruh
         else:
             raise ValueError(f"Unsupported index type: {index_type}")
         
@@ -996,31 +867,28 @@ class SpectraSearchPipeline:
         batch_size=1000, 
         max_memory_gb=4.0,
         enable_checkpointing=True,
-        resume_checkpoint_id=None,
-        file_format='auto'
+        resume_checkpoint_id=None
     ):
         """
         Process dataset using memory-efficient streaming with checkpoint support.
         
         Args:
-            input_filepath: Path to spectral library file(s)
+            input_filepath: Path to MGF file(s)
             batch_size: Number of spectra per batch
             max_memory_gb: Maximum memory to use in GB
             enable_checkpointing: Whether to save checkpoints
             resume_checkpoint_id: Checkpoint ID to resume from
-            file_format: Format of input files ('mgf', 'sptxt', or 'auto')
         """
         from data_loader import SpectraDataLoader
         
-        logger.info(f"Processing dataset from {input_filepath} using streaming with checkpointing (format: {file_format})")
+        logger.info(f"Processing dataset from {input_filepath} using streaming with checkpointing")
         
         # Initialize data loader
         loader = SpectraDataLoader(
             batch_size=batch_size,
             max_memory_gb=max_memory_gb,
             verbose=True,
-            enable_checkpointing=enable_checkpointing,
-            file_format=file_format  # Pass format to loader
+            enable_checkpointing=enable_checkpointing
         )
         
         # Get dimension parameters first
