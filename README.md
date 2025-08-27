@@ -5,8 +5,6 @@ HyperSpectral is a powerful mass spectrometry search tool that uses binary hyper
 ## Features
 
 - **High-Performance Search Engine**: Using binary hypervectors and FAISS indexing for fast searches
-- **Memory-Efficient Streaming Mode**: Process datasets larger than available RAM with configurable batch sizes
-- **Checkpoint Recovery**: Resume interrupted processing from saved checkpoints
 - **Precursor Mass Filtering**: Enforce precursor mass tolerance for accurate matching
 - **Hamming Distance Scoring**: Binary vector comparison for efficient similarity measurement
 - **Versatile Output Formats**: Export results as TXT, CSV, or JSON
@@ -41,39 +39,8 @@ HyperSpectral provides a command-line interface with three main commands: `build
 
 ### Building an Index
 
-#### Traditional Mode (Small to Medium Datasets)
-
-For datasets that fit in memory:
-
 ```bash
 python cli.py build --input /path/to/mgf/files --output-dir ./indices --index-type flat
-```
-
-#### Streaming Mode (Large Datasets)
-
-For datasets larger than available RAM:
-
-```bash
-python cli.py build --input /path/to/large/dataset --output-dir ./indices \
-    --streaming --batch-size 5000 --max-memory 8.0
-```
-
-#### With Checkpointing
-
-Enable checkpoint recovery for very large datasets:
-
-```bash
-python cli.py build --input /path/to/large/dataset --output-dir ./indices \
-    --streaming --enable-checkpoint --batch-size 5000 --index-type hnsw
-```
-
-#### Resume from Checkpoint
-
-If processing was interrupted:
-
-```bash
-python cli.py build --input /path/to/large/dataset --output-dir ./indices \
-    --streaming --resume-checkpoint job_20240115_143022
 ```
 
 #### Build Options
@@ -86,11 +53,6 @@ python cli.py build --input /path/to/large/dataset --output-dir ./indices \
 - `--min-mz`: Minimum m/z value to consider
 - `--max-mz`: Maximum m/z value to consider
 - `--fragment-tol`: Fragment ion tolerance in Da
-- `--streaming`: Use streaming mode for large datasets
-- `--batch-size`: Batch size for streaming mode (default: 1000)
-- `--max-memory`: Maximum memory usage in GB (default: 4.0)
-- `--enable-checkpoint`: Enable checkpointing for interruption recovery
-- `--resume-checkpoint`: Resume from specified checkpoint ID
 
 ### Searching Against an Index
 
@@ -111,49 +73,6 @@ python cli.py search --index ./indices/spectra_index.bin --query query.mgf --out
 - `--precursor-tol`: Precursor mass tolerance in Da (default: 0.05)
 - `--output-format`: Output format (choices: txt, csv, json, all, none; default: txt)
 - `--verbose`: Print detailed output
-
-### Managing Checkpoints
-
-List all available checkpoints:
-```bash
-python cli.py checkpoints list
-```
-
-Clean up a completed checkpoint:
-```bash
-python cli.py checkpoints clean job_20240115_143022
-```
-
-## Memory-Efficient Processing
-
-### Streaming Mode
-
-The streaming mode is designed for processing datasets that are too large to fit in memory. It processes data in configurable batches:
-
-- **Lazy Loading**: Reads spectra one at a time from disk
-- **Batch Processing**: Groups spectra into batches for efficient processing
-- **Memory Management**: Automatically manages memory usage with garbage collection
-- **Progress Tracking**: Shows progress during long processing runs
-
-Example for a 500GB dataset:
-```bash
-python cli.py build --input /path/to/500gb/dataset --output-dir ./indices \
-    --streaming --batch-size 10000 --max-memory 16.0 --index-type hnsw
-```
-
-### Checkpoint System
-
-The checkpoint system allows you to:
-
-- **Resume Interrupted Jobs**: Continue processing from where it stopped
-- **Track Progress**: Monitor processing status and progress
-- **Manage Resources**: Clean up completed checkpoints to free disk space
-
-Checkpoint files are stored in `./checkpoints` by default and include:
-
-- Processed batch data (HVs and metadata)
-- Job configuration and progress information
-- File processing status
 
 ## Output Format
 
