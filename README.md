@@ -18,11 +18,10 @@ HyperSpectral is a powerful mass spectrometry search tool that uses binary hyper
 - Python 3.7 or higher
 - NumPy
 - Pandas
-- FAISS (faiss-cpu or faiss-gpu)
+- FAISS (faiss-cpu)
 - Matplotlib (for visualization)
 - Joblib
 - PyYAML (for configuration files)
-- CuPy (optional, for GPU acceleration)
 - pyteomics (optional, for mzML/mzXML support)
 
 ### Install
@@ -163,18 +162,6 @@ results = pipeline.process_query_mgf('query.mgf', k=10,
 from export_utils import export_results_to_txt
 export_results_to_txt(results, 'results.txt')
 ```
-
-## Troubleshooting
-
-### Out of Memory Errors
-- Use streaming mode with smaller batch sizes
-- Reduce `--max-memory` parameter
-- Enable checkpointing to process in stages
-
-### Checkpoint Issues
-- List checkpoints with `python cli.py checkpoints list`
-- Clean old checkpoints to free disk space
-- Check `./checkpoints` directory permissions
 
 ## Contributing
 
